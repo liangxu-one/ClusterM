@@ -1,0 +1,8 @@
+__pycache__/
+coco_online_data/
+data/
+evaluation/
+log/
+model_save/
+module/__pycache__/
+PreTrainedModel/
