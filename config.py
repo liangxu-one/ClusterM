@@ -61,3 +61,12 @@ class Config():
 
         self.model_save_path = os.path.join(path, 'model_save/train_{}'.format(self.dataset))
         self.ck = 'baseline_tiny_1.pt'
+
+        self.grpo_lr = 1e-5
+        self.sample_nums = 5
+        self.grpo_all_epoch = 10
+        self.grpo_epoch = 2
+        self.grpo_batch_size = 8
+        self.policy_clip_eps = 0.2
+        self.beta = 0.04
+        self.grpo_step = 20
