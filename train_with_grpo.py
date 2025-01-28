@@ -13,20 +13,15 @@ from evaluation import compute_scores_cider
 from module.utils import _sample
 
 class GRPODataset(Dataset):
-    def __init__(self, img, sample_index, caption_mask, log_probs, advantage) -> None:
+    def __init__(self, experience_list) -> None:
         super(GRPODataset, self).__init__()
-
-        self.img = img
-        self.sample_index = sample_index
-        self.caption_mask = caption_mask
-        self.log_probs = log_probs
-        self.advantage = advantage
+        self.experience_list = experience_list
 
     def __getitem__(self, index):
-        return self.img[index], self.sample_index[index], self.caption_mask[index], self.log_probs[index], self.advantage[index]
+        return self.experience_list[index]['img'], self.experience_list[index]['sample_index'], self.experience_list[index]['attention_mask'], self.experience_list[index]['log_probs'], self.experience_list[index]['advantage']
 
     def __len__(self):
-        return len(self.img)
+        return len(self.experience_list)
 
 def set_seed(seed):
     random.seed(seed)  # 配置Python random库的随机种子
@@ -49,32 +44,41 @@ def set_seed(seed):
     # torch.backends.cudnn.deterministic = True
 
 def make_experience(model, img, caption_index, config, img_id, train_dict):
-    experience = dict()
-    all_reward_scocr = []
+    bs = img.size(0)
     eos_index = torch.tensor([config.eos_token_id]).to(img.device)
+
+    # 生成sample_nums个回答
+    img = img.unsqueeze(0).repeat(config.sample_nums, 1, 1, 1, 1).reshape(-1, img.size(-3), img.size(-2), img.size(-1))
+    caption_index = caption_index.unsqueeze(0).repeat(config.sample_nums, 1, 1).reshape(-1, caption_index.size(-1))
+
+    sample_index = _sample(model, img, caption_index, config)
+    if sample_index.size(1) < config.max_length:
+        add_eos = torch.empty([sample_index.size(0), config.max_length - sample_index.size(1)], dtype = sample_index.dtype, device = sample_index.device).fill_(eos_index[0])
+        sample_index = torch.concat([sample_index, add_eos], dim = 1)
+    assert sample_index.size(1) == config.max_length
+
+    # 计算生成时的概率
+    caption_mask = config.generator_fun(sample_index.size(1)).to(img.device).unsqueeze(0).repeat(img.size(0), 1, 1)
+    pred = model(img, sample_index, caption_mask)
+    logits = pred.log_softmax(dim = -1)
+
+    # 取出采样概率
+    get_sample_index = torch.empty_like(sample_index).fill_(config.eos_token_id)
+    get_sample_index[:, :-1] = sample_index[:, 1:]
+    logits = torch.gather(logits, dim = -1, index = get_sample_index.unsqueeze(-1)).squeeze(-1)
+    logits = logits * (sample_index != config.eos_token_id).to(torch.float32)
+
+    img = img.reshape(config.sample_nums, bs, img.size(-3), img.size(-2), img.size(-1))
+    sample_index = sample_index.reshape(config.sample_nums, bs, sample_index.size(-1))
+    caption_mask = caption_mask.reshape(config.sample_nums, bs, caption_mask.size(-2), caption_mask.size(-1))
+    logits = logits.reshape(config.sample_nums, bs, logits.size(-1))
+
+    all_reward_score = []
     for i in range(config.sample_nums):
-        sample_index = _sample(model, img, caption_index, config)
-        if sample_index.size(1) < config.max_length:
-            add_eos = torch.empty([sample_index.size(0), config.max_length - sample_index.size(1)], dtype = sample_index.dtype, device = sample_index.device).fill_(eos_index[0])
-            sample_index = torch.concat([sample_index, add_eos], dim = 1)
-        assert sample_index.size(1) == config.max_length
-
-        # 计算生成时的概率
-        caption_mask = config.generator_fun(sample_index.size(1)).to(img.device).unsqueeze(0).repeat(img.size(0), 1, 1)
-        pred = model(img, sample_index, caption_mask)
-        logits = pred.log_softmax(dim = -1)
-
-        # 取出采样概率
-        get_sample_index = torch.empty_like(sample_index).fill_(config.eos_token_id)
-        get_sample_index[:, :-1] = sample_index[:, 1:]
-        logits = torch.gather(logits, dim = -1, index = get_sample_index.unsqueeze(-1)).squeeze(-1)
-        logits = logits * (sample_index != config.eos_token_id).to(torch.float32)
-
-        sample_pred_str = config.tokenizer.batch_decode(sample_index.reshape(img.size(0), -1).tolist(), skip_special_tokens=True)
+        sample_pred_str = config.tokenizer.batch_decode(sample_index[i].reshape(bs, -1).tolist(), skip_special_tokens=True)
 
         gts = {}
         sample_res = {}
-        bs = img.size(0)
         for k in range(bs):
             image_id = int(img_id[k])
             gts[image_id] = train_dict.imgid_to_sentences[image_id]
@@ -82,17 +86,24 @@ def make_experience(model, img, caption_index, config, img_id, train_dict):
 
         reward_score = compute_scores_cider(gts, sample_res)[1]['CIDEr']
         reward_score = torch.tensor(reward_score).to(img.device)
+        all_reward_score.append(reward_score)
 
-        all_reward_scocr.append(reward_score)
-        temp_experience = {'img': img, 'sample_index': sample_index, 'attention_mask': caption_mask,
-                        'log_probs': logits, 'reward_score': reward_score, 'advantages': 0}
-        experience.setdefault(i, temp_experience)
-
-    all_reward_scocr = torch.stack(all_reward_scocr, dim = 0)
-    all_advantage = (all_reward_scocr - torch.mean(all_reward_scocr, dim = 0)) / torch.std(all_reward_scocr, dim = 0)
+    all_reward_score = torch.stack(all_reward_score, dim = 0)
+    all_advantage = (all_reward_score - torch.mean(all_reward_score, dim = 0)) / torch.std(all_reward_score, dim = 0)
     all_advantage = torch.where(torch.isfinite(all_advantage), all_advantage, torch.zeros_like(all_advantage))
-    for key in experience.keys():
-        experience[key]['advantages'] = all_advantage[key]
+
+    img = img.permute(1, 0, 2, 3, 4)
+    sample_index = sample_index.permute(1, 0, 2)
+    caption_mask = caption_mask.permute(1, 0, 2, 3)
+    logits = logits.permute(1, 0, 2)
+    all_reward_score = all_reward_score.permute(1, 0)
+    all_advantage = all_advantage.permute(1, 0)
+
+    experience = []
+    for i in range(bs):
+        temp = {'img': img[i], 'sample_index': sample_index[i], 'attention_mask': caption_mask[i],
+                        'log_probs': logits[i], 'reward_score': all_reward_score[i], 'advantage': all_advantage[i]}
+        experience.append(temp)
     return experience
 
 def train(config):
@@ -159,52 +170,11 @@ def train(config):
                 img = batch[0].to(device)
                 caption_index = batch[1].to(device)
                 experience = make_experience(model, img, caption_index, config, batch[2], train_dict)
-                experience_list.append(experience)
+                experience_list.extend(experience)
 
             if ((i + 1) % config.grpo_step == 0) or ((i + 1) == len(train_data)):
                 # 将experience_list中的数据组装为一个dataset
-                img_list = []
-                sample_index_list = []
-                caption_mask_list = []
-                log_probs_list = []
-                advantage_list = []
-
-                # 每条experience由config.sample_nums * batch_size条数据构成, 先进行处理
-                for experience in experience_list:
-                    temp_img_list = []
-                    temp_sample_index_list = []
-                    temp_caption_mask_list = []
-                    temp_log_probs_list = []
-                    temp_advantage_list = []
-                    for key in experience.keys():
-                        temp_img_list.append(experience[key]['img'])
-                        temp_sample_index_list.append(experience[key]['sample_index'])
-                        temp_caption_mask_list.append(experience[key]['attention_mask'])
-                        temp_log_probs_list.append(experience[key]['log_probs'])
-                        temp_advantage_list.append(experience[key]['advantages'])
-
-                    # 维度转换, 将一个样本的config.sample_nums条数据放在一起
-                    temp_img = torch.stack(temp_img_list, dim = 0).permute(1, 0, 2, 3, 4)
-                    temp_sample_index = torch.stack(temp_sample_index_list, dim = 0).permute(1, 0, 2)
-                    temp_caption_mask = torch.stack(temp_caption_mask_list, dim = 0).permute(1, 0, 2, 3)
-                    temp_log_probs = torch.stack(temp_log_probs_list, dim = 0).permute(1, 0, 2)
-                    temp_advantage = torch.stack(temp_advantage_list, dim = 0).permute(1, 0)
-
-                    # 加入统计列表中
-                    img_list.append(temp_img)
-                    sample_index_list.append(temp_sample_index)
-                    caption_mask_list.append(temp_caption_mask)
-                    log_probs_list.append(temp_log_probs)
-                    advantage_list.append(temp_advantage)
-
-                # 整合为一个grpo训练过程中要用的数据
-                img = torch.concat(img_list, dim = 0)
-                sample_index = torch.concat(sample_index_list, dim = 0)
-                caption_mask = torch.concat(caption_mask_list, dim = 0)
-                log_probs = torch.concat(log_probs_list, dim = 0)
-                advantage = torch.concat(advantage_list, dim = 0)
-
-                grpo_dataset = GRPODataset(img, sample_index, caption_mask, log_probs, advantage)
+                grpo_dataset = GRPODataset(experience_list)
                 grpo_dataloader = DataLoader(grpo_dataset, config.grpo_batch_size, shuffle = True)
                 experience_list = []
 
