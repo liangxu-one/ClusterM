@@ -3,7 +3,7 @@ import random
 import torch
 import numpy as np
 import torch.distributed as dist
-from torch.utils.data import Dataset, DataLoader, DistributedSampler
+from torch.utils.data import DataLoader, DistributedSampler
 from transformers import get_cosine_schedule_with_warmup
 from eval import eval
 from config import Config
@@ -11,17 +11,6 @@ from model import CaptionModel
 from read_file import build_data
 from evaluation import compute_scores_cider
 from module.utils import _sample
-
-class GRPODataset(Dataset):
-    def __init__(self, experience_list) -> None:
-        super(GRPODataset, self).__init__()
-        self.experience_list = experience_list
-
-    def __getitem__(self, index):
-        return self.experience_list[index]['img'], self.experience_list[index]['sample_index'], self.experience_list[index]['attention_mask'], self.experience_list[index]['log_probs'], self.experience_list[index]['advantage']
-
-    def __len__(self):
-        return len(self.experience_list)
 
 def set_seed(seed):
     random.seed(seed)  # 配置Python random库的随机种子
@@ -162,10 +151,9 @@ def train(config):
     for epoch in range(config.grpo_all_epoch):
 
         experience_list = []
-        model.eval()
         train_sampler.set_epoch(epoch)
         for i, batch in enumerate(train_data):
-
+            model.eval()
             with torch.no_grad():
                 img = batch[0].to(device)
                 caption_index = batch[1].to(device)
@@ -173,25 +161,28 @@ def train(config):
                 experience_list.extend(experience)
 
             if ((i + 1) % config.grpo_step == 0) or ((i + 1) == len(train_data)):
-                # 将experience_list中的数据组装为一个dataset
-                grpo_dataset = GRPODataset(experience_list)
-                grpo_dataloader = DataLoader(grpo_dataset, config.grpo_batch_size, shuffle = True)
-                experience_list = []
+                # 对数据进行打乱操作
+                random.shuffle(experience_list)
+                grpo_batch_img = torch.stack([temp['img'] for temp in experience_list], dim = 0)
+                grpo_batch_sample_index = torch.stack([temp['sample_index'] for temp in experience_list], dim = 0)
+                grpo_batch_caption_mask = torch.stack([temp['attention_mask'] for temp in experience_list], dim = 0)
+                grpo_batch_log_probs = torch.stack([temp['log_probs'] for temp in experience_list], dim = 0)
+                grpo_batch_advantage = torch.stack([temp['advantage'] for temp in experience_list], dim = 0)
 
                 for grpo_epoch in range(config.grpo_epoch):
 
                     if rank == 0:
                         print(scheduler.get_last_lr())
-
-                    for j, grpo_batch in enumerate(grpo_dataloader):
+                    j = 0
+                    while j < len(experience_list):
 
                         model.zero_grad()
 
-                        img = grpo_batch[0]
-                        sample_index = grpo_batch[1]
-                        caption_mask = grpo_batch[2]
-                        log_probs = grpo_batch[3]
-                        advantage = grpo_batch[4]
+                        img = grpo_batch_img[j:min(j + config.grpo_batch_size, len(experience_list))]
+                        sample_index = grpo_batch_sample_index[j:min(j + config.grpo_batch_size, len(experience_list))]
+                        caption_mask = grpo_batch_caption_mask[j:min(j + config.grpo_batch_size, len(experience_list))]
+                        log_probs = grpo_batch_log_probs[j:min(j + config.grpo_batch_size, len(experience_list))]
+                        advantage = grpo_batch_advantage[j:min(j + config.grpo_batch_size, len(experience_list))]
 
                         img = img.reshape(-1, img.size(-3), img.size(-2), img.size(-1))
                         sample_index = sample_index.reshape(-1, sample_index.size(-1))
@@ -229,11 +220,15 @@ def train(config):
                         optimizer.step()
                         scheduler.step()
 
-                        if rank == 0 and j % 50 == 0:
-                            print('j/batch: {}/{} | grpo_epoch/grpo_epochs: {}/{} | i/batch: {}/{} | epoch/epochs: {}/{} | loss: {}'.format(j, len(grpo_dataloader), grpo_epoch, config.grpo_epoch, i, len(train_data), epoch, config.grpo_all_epoch, loss.item()))
+                        if rank == 0 and j % (50 * config.grpo_batch_size) == 0:
+                            print('j/batch: {}/{} | grpo_epoch/grpo_epochs: {}/{} | i/batch: {}/{} | epoch/epochs: {}/{} | loss: {}'.format(j, len(experience_list), grpo_epoch, config.grpo_epoch, i, len(train_data), epoch, config.grpo_all_epoch, loss.item()))
+
+                        j = j + config.grpo_batch_size
+
+                experience_list = []
 
             if (rank == 0) and ((i + 1) % (len(train_data) // (20 // config.grpo_all_epoch)) == 0):
-                torch.save(model.module.state_dict(), os.path.join(config.model_save_path, 'rl_epoch_{}_i_{}.pt'.format(epoch, (i + 1) // (len(train_data) // (20 // config.grpo_all_epoch)))))
+                torch.save(model.module.state_dict(), os.path.join(config.model_save_path, 'rl_epoch_{}_i_{}.pt'.format(epoch, i + 1)))
                 print("test:", end = ' ')
                 with torch.no_grad():
                     eval(configVal, model, val_data, val_dict)
