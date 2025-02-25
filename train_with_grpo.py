@@ -1,4 +1,5 @@
 import os
+import copy
 import random
 import torch
 import numpy as np
@@ -113,11 +114,7 @@ def train(config):
     model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
 
     # 参考模型
-    ref_model = CaptionModel(config)
-    ref_model.load_state_dict(torch.load(os.path.join(config.model_save_path, config.ck), map_location='cpu'))
-    ref_model.to(device)
-    ref_model = torch.nn.parallel.DistributedDataParallel(ref_model, [device])
-    ref_model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(ref_model)
+    ref_model = copy.deepcopy(model)
     for p in ref_model.module.parameters():
         p.requires_grad = False
 
@@ -227,7 +224,7 @@ def train(config):
 
                 experience_list = []
 
-            if (rank == 0) and ((i + 1) % (len(train_data) // (20 // config.grpo_all_epoch)) == 0):
+            if (rank == 0) and (((i + 1) % (len(train_data) // config.grpo_save_frequency) == 0) or ((i + 1) == len(train_data))):
                 torch.save(model.module.state_dict(), os.path.join(config.model_save_path, 'rl_epoch_{}_i_{}.pt'.format(epoch, i + 1)))
                 print("test:", end = ' ')
                 with torch.no_grad():

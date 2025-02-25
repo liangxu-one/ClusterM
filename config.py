@@ -64,9 +64,10 @@ class Config():
 
         self.grpo_lr = 1e-5
         self.sample_nums = 5
-        self.grpo_all_epoch = 10
+        self.grpo_all_epoch = 5
         self.grpo_epoch = 2
         self.grpo_batch_size = 8
         self.policy_clip_eps = 0.2
         self.beta = 0.04
         self.grpo_step = 20
+        self.grpo_save_frequency = 4
